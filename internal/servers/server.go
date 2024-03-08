@@ -3,12 +3,18 @@
 package servers
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"github.com/TeaOSLab/firewall-server/internal/firewalls"
+	executils "github.com/TeaOSLab/firewall-server/internal/utils/exec"
 	"github.com/iwind/TeaGo/maps"
 	"github.com/iwind/TeaGo/types"
 	"net"
 	"net/http"
+	"os"
+	"time"
 )
 
 type Server struct {
@@ -37,10 +43,89 @@ func (this *Server) Listen() error {
 	mux.HandleFunc("/removeSourceIP", this.handleRemoveSourceIP)
 
 	var httpServer = &http.Server{
-		Addr:                         this.addr,
-		Handler:                      mux,
+		Addr:    this.addr,
+		Handler: mux,
 	}
 	return httpServer.ListenAndServe()
+}
+
+func (this *Server) InstallService() error {
+	systemd, err := executils.LookPath("systemctl")
+	if err != nil {
+		return nil
+	}
+
+	shPath, err := executils.LookPath("sh")
+	if err != nil {
+		return nil
+	}
+
+	exePath, _ := os.Executable()
+	if len(exePath) == 0 {
+		return errors.New("can not find executable path")
+	}
+
+	var systemdServiceFile = "/etc/systemd/system/edge-firewall-server.service"
+
+
+	serviceData, err := os.ReadFile(systemdServiceFile)
+	if err == nil && len(serviceData) > 0 && (bytes.Contains(serviceData, []byte("ExecStart="+exePath)) || bytes.Contains(serviceData, []byte("ExecStart=" + shPath + " "+exePath + ".sh"))) {
+		return nil
+	}
+
+	err = os.WriteFile(exePath + ".sh", []byte(`#!/usr/bin/env bash
+
+` + exePath), 0733)
+	if err != nil {
+		return fmt.Errorf("create boot shell file failed: %w", err)
+	}
+
+	var shortName = "edge-firewall-server"
+	var longName = "edge-firewall-server"
+
+	var desc = `### BEGIN INIT INFO
+# Provides:          ` + shortName + `
+# Required-Start:     $local_fs $network
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:
+# Short-Description: ` + longName + ` Service
+### END INIT INFO
+
+[Unit]
+Description=` + longName + ` Service
+Before=shutdown.target
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1s
+ExecStart=` + shPath + " " + exePath + `.sh
+
+[Install]
+WantedBy=multi-user.target`
+
+	// write file
+	err = os.WriteFile(systemdServiceFile, []byte(desc), 0777)
+	if err != nil {
+		return err
+	}
+
+	// stop current systemd service if running
+	_ = executils.NewTimeoutCmd(10*time.Second, systemd, "stop", shortName+".service").Start()
+
+	// reload
+	_ = executils.NewTimeoutCmd(10*time.Second, systemd, "daemon-reload").Start()
+
+	// enable
+	var cmd = executils.NewTimeoutCmd(10*time.Second, systemd, "enable", shortName+".service")
+	cmd.WithStderr()
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, cmd.Stderr())
+	}
+	return nil
 }
 
 func (this *Server) handleName(writer http.ResponseWriter, req *http.Request) {
